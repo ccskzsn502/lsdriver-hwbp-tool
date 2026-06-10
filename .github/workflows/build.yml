@@ -30,8 +30,12 @@ jobs:
             -o ls-hwbp
           file ls-hwbp
           chmod 755 ls-hwbp
+          cp scripts/ls-hwbp-cn ls-hwbp-cn
+          chmod 755 ls-hwbp-cn
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ls-hwbp-tool-arm64
-          path: ls-hwbp
+          path: |
+            ls-hwbp
+            ls-hwbp-cn
