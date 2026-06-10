@@ -64,10 +64,13 @@ static bool connect_driver(){
 
 static void usage(){
     puts("Usage:");
+    puts("  ls-hwbp");
     puts("  ls-hwbp ping");
     puts("  ls-hwbp info");
     puts("  ls-hwbp remove");
     puts("  ls-hwbp monitor --pid PID --type x|r|w|rw --addr ADDR --len 1..8 --scope main|other|all [--interval MS]");
+    puts("");
+    puts("No arguments = interactive menu mode.");
 }
 
 static int cmd_ping(){ if(!connect_driver())return 1; if(!commit(op_o)){fprintf(stderr,"ping timeout\n");return 1;} puts("pong"); return 0; }
@@ -94,4 +97,114 @@ static int cmd_monitor(int argc,char**argv){
     puts("\nstopping..."); commit(op_remove_process_hwbp,2000); return 0;
 }
 
-int main(int argc,char**argv){ if(argc<2){usage();return 2;} std::string c=argv[1]; if(c=="ping")return cmd_ping(); if(c=="info")return cmd_info(); if(c=="remove")return cmd_remove(); if(c=="monitor")return cmd_monitor(argc,argv); usage(); return 2; }
+static bool prompt_line(const char* text, char* buf, size_t size){
+    printf("%s", text); fflush(stdout);
+    if(!fgets(buf, size, stdin)) return false;
+    size_t n=strlen(buf); if(n && buf[n-1]=='\n') buf[n-1]=0;
+    return true;
+}
+
+static int prompt_int(const char* text, int defv){
+    char b[128]; if(!prompt_line(text,b,sizeof(b))) return defv;
+    if(!b[0]) return defv;
+    return (int)parse_u64(b);
+}
+
+static uint64_t prompt_u64(const char* text, uint64_t defv){
+    char b[128]; if(!prompt_line(text,b,sizeof(b))) return defv;
+    if(!b[0]) return defv;
+    return parse_u64(b);
+}
+
+static std::string prompt_str(const char* text, const char* defv){
+    char b[128]; if(!prompt_line(text,b,sizeof(b))) return defv;
+    if(!b[0]) return defv;
+    return std::string(b);
+}
+
+static void menu_header(){
+    puts("");
+    puts("==============================");
+    puts(" lsdriver HWBP interactive UI");
+    puts("==============================");
+    puts("1) Ping driver");
+    puts("2) Show BRP/WRP info");
+    puts("3) Set and monitor breakpoint/watchpoint");
+    puts("4) Remove current monitor");
+    puts("5) Exit");
+}
+
+static int interactive_info(){
+    memset(&g_req->bp_info,0,sizeof(g_req->bp_info));
+    if(!commit(op_brps_weps_info)){fprintf(stderr,"info timeout\n");return 1;}
+    printf("BRP execute slots: %" PRIu64 "\n",g_req->bp_info.num_brps);
+    printf("WRP watch slots:   %" PRIu64 "\n",g_req->bp_info.num_wrps);
+    return 0;
+}
+
+static int interactive_remove(){
+    if(!commit(op_remove_process_hwbp)){fprintf(stderr,"remove timeout\n");return 1;}
+    puts("removed");
+    return 0;
+}
+
+static void interactive_print_loop(hwbp_point& p, int interval, int duration_sec){
+    g_stop=0; signal(SIGINT,sigint); signal(SIGTERM,sigint);
+    int last_count=-1; uint64_t last_hits[0x100]{};
+    int elapsed=0;
+    while(!g_stop){
+        int c=p.record_count; if(c<0)c=0; if(c>0x100)c=0x100;
+        bool changed=(c!=last_count);
+        for(int i=0;i<c;i++){ if(p.records[i].hit_count!=last_hits[i]){changed=true; last_hits[i]=p.records[i].hit_count;}}
+        if(changed){ printf("\nrecords=%d\n",c); for(int i=0;i<c;i++)print_record(i,p.records[i]); fflush(stdout); last_count=c; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(interval));
+        elapsed += interval;
+        if(duration_sec>0 && elapsed >= duration_sec*1000) break;
+    }
+}
+
+static int interactive_monitor(){
+    Args a;
+    a.pid=prompt_int("PID: ",-1);
+    a.addr=prompt_u64("Address, hex OK, e.g. 0x1234: ",0);
+    a.type=parse_type(prompt_str("Type [x/r/w/rw] default x: ","x"));
+    a.len=prompt_int("Len [1..8], execute usually 4, default 4: ",4);
+    a.scope=parse_scope(prompt_str("Scope [main/other/all] default all: ","all"));
+    a.interval=prompt_int("Refresh interval ms default 500: ",500);
+    int duration=prompt_int("Monitor seconds, 0 = until Ctrl+C, default 0: ",0);
+    if(a.pid<=0||!a.addr||a.len<1||a.len>8){ puts("invalid input"); return 1; }
+    if(a.interval<50)a.interval=50;
+    if(a.type==HWBP_BREAKPOINT_X&&a.len!=4) fprintf(stderr,"warning: AArch64 execute breakpoint normally uses len 4\n");
+
+    memset(&g_req->bp_info,0,sizeof(g_req->bp_info)); g_req->pid=a.pid;
+    hwbp_point& p=g_req->bp_info.points[0];
+    p.bt=a.type; p.bl=(hwbp_len)a.len; p.bs=a.scope; p.hit_addr=a.addr; p.record_count=0;
+    if(!commit(op_set_process_hwbp)){fprintf(stderr,"set timeout\n");return 1;}
+    if(g_req->status!=0){fprintf(stderr,"set failed status=%d\n",g_req->status);return 1;}
+    printf("monitor pid=%d type=%s addr=0x%016" PRIx64 " len=%d scope=%s interval=%dms\n",a.pid,type_name(a.type),a.addr,a.len,scope_name(a.scope),a.interval);
+    puts(duration>0 ? "monitoring..." : "Ctrl+C to stop");
+    interactive_print_loop(p,a.interval,duration);
+    puts("\nstopping...");
+    commit(op_remove_process_hwbp,2000);
+    return 0;
+}
+
+static int cmd_interactive(){
+    puts("Starting interactive mode...");
+    if(!connect_driver()) return 1;
+    puts("Connected.");
+    for(;;){
+        menu_header();
+        int choice=prompt_int("Select: ",0);
+        if(choice==1){ if(!commit(op_o)) fprintf(stderr,"ping timeout\n"); else puts("pong"); }
+        else if(choice==2) interactive_info();
+        else if(choice==3) interactive_monitor();
+        else if(choice==4) interactive_remove();
+        else if(choice==5) break;
+        else puts("unknown option");
+    }
+    puts("bye");
+    return 0;
+}
+
+int main(int argc,char**argv){ if(argc<2)return cmd_interactive(); std::string c=argv[1]; if(c=="menu"||c=="interactive")return cmd_interactive(); if(c=="ping")return cmd_ping(); if(c=="info")return cmd_info(); if(c=="remove")return cmd_remove(); if(c=="monitor")return cmd_monitor(argc,argv); usage(); return 2; }
