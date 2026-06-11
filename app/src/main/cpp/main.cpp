@@ -2,7 +2,6 @@
 #include <sys/prctl.h>
 #include <unistd.h>
 #include <signal.h>
-#include <dirent.h>
 #include <ctype.h>
 #include <cerrno>
 #include <cinttypes>
@@ -18,7 +17,7 @@ static constexpr uintptr_t LS_SHARED_ADDR = 0x2025827000ULL;
 enum hwbp_type { HWBP_BREAKPOINT_EMPTY=0, HWBP_BREAKPOINT_R=1, HWBP_BREAKPOINT_W=2, HWBP_BREAKPOINT_RW=3, HWBP_BREAKPOINT_X=4, HWBP_BREAKPOINT_INVALID=7 };
 enum hwbp_len { HWBP_BREAKPOINT_LEN_1=1, HWBP_BREAKPOINT_LEN_2, HWBP_BREAKPOINT_LEN_3, HWBP_BREAKPOINT_LEN_4, HWBP_BREAKPOINT_LEN_5, HWBP_BREAKPOINT_LEN_6, HWBP_BREAKPOINT_LEN_7, HWBP_BREAKPOINT_LEN_8 };
 enum hwbp_scope { SCOPE_MAIN_THREAD, SCOPE_OTHER_THREADS, SCOPE_ALL_THREADS };
-enum sm_req_op { op_o, op_r, op_w, op_m, op_down, op_move, op_up, op_init_touch, op_brps_weps_info, op_set_process_hwbp, op_remove_process_hwbp, op_kexit };
+enum sm_req_op { op_o, op_r, op_w, op_m, op_down, op_move, op_up, op_init_touch, op_brps_weps_info, op_find_process_by_name, op_set_process_hwbp, op_remove_process_hwbp, op_kexit };
 
 struct hwbp_record {
     uint8_t mask[18];
@@ -37,7 +36,9 @@ struct region_info { uint64_t start; uint64_t end; };
 struct memory_info { int module_count; module_info modules[MAX_MODULES]; int region_count; region_info regions[MAX_SCAN_REGIONS]; };
 struct virtual_input { int POSITION_X, POSITION_Y; int slot; int x, y; };
 struct memory_rw { uint64_t rw_addr; uint8_t user_buffer[0x1000]; int size; };
-struct req_obj { bool kernel; bool user; sm_req_op op; int status; int pid; memory_rw rw_info; memory_info mem_info; virtual_input vinput_info; hwbp_info bp_info; };
+static constexpr int PROC_NAME_LEN=256;
+struct process_select_info { char name[PROC_NAME_LEN]; int selected_pid; uint64_t selected_rss_kb; };
+struct req_obj { bool kernel; bool user; sm_req_op op; int status; int pid; process_select_info proc_info; memory_rw rw_info; memory_info mem_info; virtual_input vinput_info; hwbp_info bp_info; };
 
 static req_obj* g_req=nullptr;
 static volatile sig_atomic_t g_stop=0;
@@ -108,84 +109,10 @@ static bool prompt_line(const char* text,char* buf,size_t size){
 static int prompt_int(const char* text,int defv){ char b[128]; if(!prompt_line(text,b,sizeof(b))||!b[0]) return defv; return (int)parse_u64(b); }
 static uint64_t prompt_u64(const char* text,uint64_t defv){ char b[128]; if(!prompt_line(text,b,sizeof(b))||!b[0]) return defv; return parse_u64(b); }
 static std::string prompt_str(const char* text,const char* defv){ char b[256]; if(!prompt_line(text,b,sizeof(b))||!b[0]) return defv; return std::string(b); }
-
-static std::string read_cmdline(int pid){
-    char path[64]; snprintf(path,sizeof(path),"/proc/%d/cmdline",pid);
-    FILE* f=fopen(path,"rb"); if(!f) return {};
-    char buf[512]; size_t n=fread(buf,1,sizeof(buf)-1,f); fclose(f);
-    if(!n) return {};
-    buf[n]=0;
-    for(size_t i=0;i<n;i++) if(buf[i]=='\0') buf[i]=' ';
-    while(n>0 && buf[n-1]==' ') buf[--n]=0;
-    return std::string(buf);
-}
-static uint64_t read_rss_kb(int pid){
-    char path[64]; snprintf(path,sizeof(path),"/proc/%d/status",pid);
-    FILE* f=fopen(path,"r"); if(!f) return 0;
-    char line[256]; uint64_t rss=0;
-    while(fgets(line,sizeof(line),f)){
-        if(strncmp(line,"VmRSS:",6)==0){
-            char* p=line+6;
-            while(*p && !isdigit((unsigned char)*p)) p++;
-            rss=strtoull(p,nullptr,10);
-            break;
-        }
-    }
-    fclose(f);
-    return rss;
+static std::string prompt_target(){
+    return prompt_str("包名/进程名/PID，由内核层查找，留空手动输入 PID: ","");
 }
 
-static int find_pid_by_name(const std::string& name){
-    if(name.empty()) return -1;
-    if(is_digits(name.c_str())) return (int)parse_u64(name.c_str());
-    DIR* d=opendir("/proc");
-    if(!d){ perror("打开 /proc 失败"); return -1; }
-
-    int exact_pid=-1;
-    uint64_t exact_rss=0;
-    int best_pid=-1;
-    uint64_t best_rss=0;
-    std::string best_cmd;
-    dirent* e;
-
-    while((e=readdir(d))){
-        if(!is_digits(e->d_name)) continue;
-        int pid=atoi(e->d_name); if(pid<=0) continue;
-        std::string cmd=read_cmdline(pid); if(cmd.empty()) continue;
-        uint64_t rss=read_rss_kb(pid);
-
-        if(cmd==name){
-            exact_pid=pid;
-            exact_rss=rss;
-            break;
-        }
-        if(cmd.find(name)!=std::string::npos){
-            if(rss>best_rss){
-                best_rss=rss;
-                best_pid=pid;
-                best_cmd=cmd;
-            }
-        }
-    }
-    closedir(d);
-
-    if(exact_pid>0){
-        printf("选择主进程: PID=%d  RSS=%" PRIu64 "KB  CMD=%s\n",exact_pid,exact_rss,name.c_str());
-        return exact_pid;
-    }
-    if(best_pid>0){
-        printf("选择匹配进程中内存最大的: PID=%d  RSS=%" PRIu64 "KB  CMD=%s\n",best_pid,best_rss,best_cmd.c_str());
-        return best_pid;
-    }
-    return -1;
-}
-static int prompt_pid(){
-    std::string target=prompt_str("包名/进程名/PID，留空手动输入 PID: ","");
-    int pid=find_pid_by_name(target);
-    if(pid>0) return pid;
-    if(!target.empty()) printf("没找到进程: %s\n",target.c_str());
-    return prompt_int("PID: ",-1);
-}
 
 static void usage(){
     puts("用法:");
@@ -193,7 +120,7 @@ static void usage(){
     puts("  ls-hwbp ping                  测试驱动连接");
     puts("  ls-hwbp info                  查看 BRP/WRP 数量");
     puts("  ls-hwbp remove                删除断点/观察点");
-    puts("  ls-hwbp monitor --pid PID --type x|r|w|rw --addr ADDR --len 1..8 --scope main|other|all [--interval MS]");
+    puts("  ls-hwbp monitor --target 包名或PID --type x|r|w|rw --addr ADDR --len 1..8 --scope main|other|all [--interval MS]");
 }
 
 static void print_reg_pair(const char* a,uint64_t av,const char* b,uint64_t bv){
@@ -251,17 +178,20 @@ static void monitor_loop(hwbp_point& p,int interval,int duration_sec){
     }
 }
 
-static int set_monitor_connected(int pid,uint64_t addr,hwbp_type type,int len,hwbp_scope scope,int interval,int duration){
-    if(pid<=0 || !addr || len<1 || len>8){ puts("输入无效"); return 1; }
+static int set_monitor_connected(const std::string& target,uint64_t addr,hwbp_type type,int len,hwbp_scope scope,int interval,int duration){
+    if(target.empty() || !addr || len<1 || len>8){ puts("输入无效"); return 1; }
     if(interval<50) interval=50;
     if(type==HWBP_BREAKPOINT_X && len!=4) fprintf(stderr,"提示: ARM64 执行断点通常长度为 4\n");
     memset(&g_req->bp_info,0,sizeof(g_req->bp_info));
-    g_req->pid=pid;
+    memset(&g_req->proc_info,0,sizeof(g_req->proc_info));
+    g_req->pid=0;
+    snprintf(g_req->proc_info.name,sizeof(g_req->proc_info.name),"%s",target.c_str());
     hwbp_point& p=g_req->bp_info.points[0];
     p.bt=type; p.bl=(hwbp_len)len; p.bs=scope; p.hit_addr=addr; p.record_count=0;
     if(!commit_req(op_set_process_hwbp)){ fprintf(stderr,"设置断点超时\n"); return 1; }
-    if(g_req->status!=0){ fprintf(stderr,"设置失败 status=%d\n",g_req->status); return 1; }
-    printf("已开始监控: PID=%d 类型=%s 地址=0x%016" PRIx64 " 长度=%d 范围=%s 刷新=%dms\n",pid,type_name(type),addr,len,scope_name(scope),interval);
+    if(g_req->status!=0){ fprintf(stderr,"设置失败 status=%d，目标=%s\n",g_req->status,target.c_str()); return 1; }
+    printf("内核已选择进程: PID=%d RSS=%" PRIu64 "KB 目标=%s\n",g_req->pid,g_req->proc_info.selected_rss_kb,target.c_str());
+    printf("已开始监控: PID=%d 类型=%s 地址=0x%016" PRIx64 " 长度=%d 范围=%s 刷新=%dms\n",g_req->pid,type_name(type),addr,len,scope_name(scope),interval);
     puts(duration>0 ? "正在监控..." : "按 Ctrl+C 停止监控");
     monitor_loop(p,interval,duration);
     puts("\n正在停止并删除断点...");
@@ -273,14 +203,14 @@ static int cmd_ping(){ if(!connect_driver()) return 1; if(!commit_req(op_o)){fpr
 static int cmd_info(){ if(!connect_driver()) return 1; return info_connected(); }
 static int cmd_remove(){ if(!connect_driver()) return 1; return remove_connected(); }
 
-struct Args { int pid=-1; uint64_t addr=0; hwbp_type type=HWBP_BREAKPOINT_EMPTY; int len=0; hwbp_scope scope=SCOPE_ALL_THREADS; int interval=1000; };
+struct Args { std::string target; uint64_t addr=0; hwbp_type type=HWBP_BREAKPOINT_EMPTY; int len=0; hwbp_scope scope=SCOPE_ALL_THREADS; int interval=1000; };
 
 static Args parse_args(int argc,char** argv){
     Args a;
     for(int i=2;i<argc;i++){
         std::string k=argv[i];
         auto val=[&](){ if(i+1>=argc){fprintf(stderr,"%s 缺少参数\n",k.c_str());exit(2);} return argv[++i]; };
-        if(k=="--pid") a.pid=(int)parse_u64(val());
+        if(k=="--pid"||k=="--target"||k=="--name") a.target=val();
         else if(k=="--addr") a.addr=parse_u64(val());
         else if(k=="--type") a.type=parse_type(val());
         else if(k=="--len") a.len=(int)parse_u64(val());
@@ -293,7 +223,7 @@ static Args parse_args(int argc,char** argv){
 static int cmd_monitor(int argc,char** argv){
     Args a=parse_args(argc,argv);
     if(!connect_driver()) return 1;
-    return set_monitor_connected(a.pid,a.addr,a.type,a.len,a.scope,a.interval,0);
+    return set_monitor_connected(a.target,a.addr,a.type,a.len,a.scope,a.interval,0);
 }
 
 static void menu(){
@@ -308,14 +238,15 @@ static void menu(){
     puts("5) 退出");
 }
 static int interactive_monitor(){
-    int pid=prompt_pid();
+    std::string target=prompt_target();
+    if(target.empty()) target=prompt_str("手动输入 PID: ","");
     uint64_t addr=prompt_u64("监控地址，支持十六进制，例如 0x1234: ",0);
     hwbp_type type=parse_type(prompt_str("类型 [x执行/r读/w写/rw读写] 默认 x: ","x"));
     int len=prompt_int("长度 [1..8]，执行断点通常填 4，默认 4: ",4);
     hwbp_scope scope=parse_scope(prompt_str("线程范围 [main主线程/other子线程/all全部] 默认 all: ","all"));
     int interval=prompt_int("刷新间隔毫秒，默认 500: ",500);
     int duration=prompt_int("监控秒数，0 表示一直监控直到 Ctrl+C，默认 0: ",0);
-    return set_monitor_connected(pid,addr,type,len,scope,interval,duration);
+    return set_monitor_connected(target,addr,type,len,scope,interval,duration);
 }
 static int interactive(){
     puts("启动中文交互界面...");
