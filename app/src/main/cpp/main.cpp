@@ -119,24 +119,65 @@ static std::string read_cmdline(int pid){
     while(n>0 && buf[n-1]==' ') buf[--n]=0;
     return std::string(buf);
 }
+static uint64_t read_rss_kb(int pid){
+    char path[64]; snprintf(path,sizeof(path),"/proc/%d/status",pid);
+    FILE* f=fopen(path,"r"); if(!f) return 0;
+    char line[256]; uint64_t rss=0;
+    while(fgets(line,sizeof(line),f)){
+        if(strncmp(line,"VmRSS:",6)==0){
+            char* p=line+6;
+            while(*p && !isdigit((unsigned char)*p)) p++;
+            rss=strtoull(p,nullptr,10);
+            break;
+        }
+    }
+    fclose(f);
+    return rss;
+}
+
 static int find_pid_by_name(const std::string& name){
     if(name.empty()) return -1;
     if(is_digits(name.c_str())) return (int)parse_u64(name.c_str());
     DIR* d=opendir("/proc");
     if(!d){ perror("打开 /proc 失败"); return -1; }
-    int found=-1;
+
+    int exact_pid=-1;
+    uint64_t exact_rss=0;
+    int best_pid=-1;
+    uint64_t best_rss=0;
+    std::string best_cmd;
     dirent* e;
+
     while((e=readdir(d))){
         if(!is_digits(e->d_name)) continue;
         int pid=atoi(e->d_name); if(pid<=0) continue;
         std::string cmd=read_cmdline(pid); if(cmd.empty()) continue;
-        if(cmd==name || cmd.find(name)!=std::string::npos){
-            printf("找到进程: PID=%d  CMD=%s\n",pid,cmd.c_str());
-            found=pid; break;
+        uint64_t rss=read_rss_kb(pid);
+
+        if(cmd==name){
+            exact_pid=pid;
+            exact_rss=rss;
+            break;
+        }
+        if(cmd.find(name)!=std::string::npos){
+            if(rss>best_rss){
+                best_rss=rss;
+                best_pid=pid;
+                best_cmd=cmd;
+            }
         }
     }
     closedir(d);
-    return found;
+
+    if(exact_pid>0){
+        printf("选择主进程: PID=%d  RSS=%" PRIu64 "KB  CMD=%s\n",exact_pid,exact_rss,name.c_str());
+        return exact_pid;
+    }
+    if(best_pid>0){
+        printf("选择匹配进程中内存最大的: PID=%d  RSS=%" PRIu64 "KB  CMD=%s\n",best_pid,best_rss,best_cmd.c_str());
+        return best_pid;
+    }
+    return -1;
 }
 static int prompt_pid(){
     std::string target=prompt_str("包名/进程名/PID，留空手动输入 PID: ","");
