@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <cstdarg>
+#include <sys/mman.h>
 
 // ====================== 最小 JSON 实现 ======================
 namespace js {

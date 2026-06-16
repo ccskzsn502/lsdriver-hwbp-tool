@@ -35,14 +35,9 @@ bool connect_driver(){
         }
         g_req->kernel = false; __sync_synchronize();
         // ping 失败，清理旧状态后重新连接
+        munmap(g_req, sizeof(req_obj));
         g_req = nullptr;
         fprintf(stderr, "[MCP-reconnect] ping failed, reconnecting...\n");
-    }
-
-    // 先清理旧的映射
-    if(g_req) {
-        munmap((void*)LS_SHARED_ADDR, sizeof(req_obj));
-        g_req = nullptr;
     }
 
     if(prctl(PR_SET_NAME,"LS",0,0,0)!=0){ fprintf(stderr,"设置进程名失败: %s\n",strerror(errno)); return false; }
