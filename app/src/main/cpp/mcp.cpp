@@ -431,6 +431,208 @@ static void handle_line(const std::string& line){
     send_message(resp);
 }
 
+// ====================== HTTP MCP 服务器（简化 REST API） ======================
+// 用于手机 Claude App 场景：启动 HTTP 服务，AI 通过 http_request 直接调用
+
+#include <sys/socket.h>
+#include <netinet/in.h>
+
+static std::string url_decode(const std::string& src) {
+    std::string out;
+    for(size_t i = 0; i < src.size(); i++) {
+        if(src[i] == '%' && i + 2 < src.size()) {
+            char buf[3] = {src[i+1], src[i+2], 0};
+            out += (char)strtol(buf, nullptr, 16);
+            i += 2;
+        } else if(src[i] == '+') {
+            out += ' ';
+        } else {
+            out += src[i];
+        }
+    }
+    return out;
+}
+
+static std::string http_response(int code, const std::string& content_type, const std::string& body) {
+    char header[256];
+    snprintf(header, sizeof(header),
+        "HTTP/1.1 %d OK\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %zu\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        code, content_type.c_str(), body.size());
+    return std::string(header) + body;
+}
+
+static std::string http_json(const js::ValuePtr& v) {
+    return http_response(200, "application/json", js::serialize(v));
+}
+
+// 处理 HTTP 请求：GET /tools/list, GET /tools/call/:name?args=...
+static void handle_http_client(int client_fd) {
+    char buf[8192];
+    ssize_t n = read(client_fd, buf, sizeof(buf)-1);
+    if(n <= 0) { close(client_fd); return; }
+    buf[n] = 0;
+
+    // 解析请求行
+    std::string req(buf);
+    size_t sp1 = req.find(' ');
+    if(sp1 == std::string::npos) { close(client_fd); return; }
+    size_t sp2 = req.find(' ', sp1+1);
+    if(sp2 == std::string::npos) { close(client_fd); return; }
+    std::string method = req.substr(0, sp1);
+    std::string path_full = req.substr(sp1+1, sp2-sp1-1);
+
+    // 解析路径和查询参数
+    size_t qmark = path_full.find('?');
+    std::string path = (qmark != std::string::npos) ? path_full.substr(0, qmark) : path_full;
+    std::string query = (qmark != std::string::npos) ? path_full.substr(qmark+1) : "";
+
+    // 解析 POST body（简单 JSON）
+    std::string post_body;
+    if(method == "POST") {
+        size_t body_start = req.find("\r\n\r\n");
+        if(body_start != std::string::npos) {
+            post_body = req.substr(body_start + 4);
+        }
+    }
+
+    // 构建参数 JSON
+    auto args = js::Value::mkobj();
+
+    // 从 query string 解析参数
+    if(!query.empty()) {
+        size_t pos = 0;
+        while(pos < query.size()) {
+            size_t amp = query.find('&', pos);
+            std::string pair = query.substr(pos, amp - pos);
+            size_t eq = pair.find('=');
+            if(eq != std::string::npos) {
+                std::string key = url_decode(pair.substr(0, eq));
+                std::string val = url_decode(pair.substr(eq+1));
+                args->set(key, js::Value::mkstr(val));
+            }
+            if(amp == std::string::npos) break;
+            pos = amp + 1;
+        }
+    }
+
+    // 从 POST body 解析（JSON）
+    if(!post_body.empty()) {
+        js::Parser parser(post_body);
+        auto body_json = parser.parse();
+        if(parser.ok && body_json && body_json->t == js::OBJ) {
+            for(auto& kv : body_json->obj) {
+                args->set(kv.first, kv.second);
+            }
+        }
+    }
+
+    std::string resp;
+
+    if(path == "/tools/list" || path == "/") {
+        auto arr = build_tools_list();
+        resp = http_json(arr);
+    }
+    else if(path.find("/tools/call/") == 0) {
+        std::string tool_name = path.substr(12);
+        // 解码 URL 编码的工具名
+        tool_name = url_decode(tool_name);
+        auto result = dispatch_tool(tool_name, args);
+        auto obj = js::Value::mkobj();
+        obj->set("ok", js::Value::mkbool(true));
+        if(result->get("isError")) {
+            obj->set("ok", js::Value::mkbool(false));
+        }
+        obj->set("result", result);
+        resp = http_json(obj);
+    }
+    else {
+        resp = http_response(404, "text/plain", "Not Found: " + path);
+    }
+
+    write(client_fd, resp.data(), resp.size());
+    close(client_fd);
+}
+
+int run_mcp_http_server(int port) {
+    // 先连接驱动（预连接）
+    connect_driver();
+
+    // 打开调试日志
+    g_debug_log = fopen("/data/local/tmp/ls-hwbp-mcp.log", "a");
+    if(g_debug_log) {
+        fprintf(g_debug_log, "=== HTTP MCP server start ===\n");
+        fflush(g_debug_log);
+    }
+
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if(server_fd < 0) {
+        fprintf(stderr, "socket failed: %s\n", strerror(errno));
+        if(g_debug_log) { fprintf(g_debug_log, "socket failed\n"); fclose(g_debug_log); }
+        return 1;
+    }
+
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(port);
+
+    if(bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "bind :%d failed: %s\n", port, strerror(errno));
+        if(g_debug_log) { fprintf(g_debug_log, "bind :%d failed: %s\n", port, strerror(errno)); fclose(g_debug_log); }
+        close(server_fd);
+        return 1;
+    }
+
+    if(listen(server_fd, 8) < 0) {
+        fprintf(stderr, "listen failed: %s\n", strerror(errno));
+        if(g_debug_log) { fprintf(g_debug_log, "listen failed\n"); fclose(g_debug_log); }
+        close(server_fd);
+        return 1;
+    }
+
+    printf("HTTP MCP server started: http://127.0.0.1:%d\n", port);
+    printf("Tools available via: http://127.0.0.1:%d/tools/list\n", port);
+    printf("Call a tool: GET http://127.0.0.1:%d/tools/call/ping\n", port);
+    printf("Log file: /data/local/tmp/ls-hwbp-mcp.log\n");
+    printf("Press Ctrl+C to stop.\n");
+    if(g_debug_log) {
+        fprintf(g_debug_log, "HTTP MCP server listening on port %d\n", port);
+        fflush(g_debug_log);
+    }
+
+    while(true) {
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
+        if(client_fd < 0) {
+            if(errno == EINTR) break;
+            continue;
+        }
+        handle_http_client(client_fd);
+    }
+
+    close(server_fd);
+    if(g_req) {
+        munmap((void*)LS_SHARED_ADDR, sizeof(req_obj));
+        g_req = nullptr;
+    }
+    if(g_debug_log) {
+        fprintf(g_debug_log, "=== HTTP MCP server stopped ===\n");
+        fclose(g_debug_log);
+        g_debug_log = nullptr;
+    }
+    return 0;
+}
+
 int run_mcp_server(){
     // 把驱动层 printf 重定向到 stderr，避免污染 JSON-RPC 流
     g_real_out = dup(1);

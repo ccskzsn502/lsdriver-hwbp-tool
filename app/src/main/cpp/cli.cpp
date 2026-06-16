@@ -115,8 +115,9 @@ static void print_interactive_menu(){
     puts("5) 读取内存");
     puts("6) 写入内存");
     puts("7) 删除当前断点/观察点");
-    puts("8) 启动 MCP 模式");
-    puts("9) 退出");
+    puts("8) 启动 MCP 模式 (TCP 37651 - 供 Operit 使用)");
+    puts("9) 启动 HTTP MCP 模式 (HTTP 37662 - 供 Claude App 直连)");
+    puts("10) 退出");
 }
 
 static void reap_children(int){
@@ -198,6 +199,47 @@ static int start_mcp_bridge(){
     return 0;
 }
 
+static int start_http_mcp_bridge(){
+    puts("\n正在启动 HTTP MCP 桥接服务...");
+    const char* pidfile = "/data/local/tmp/ls-hwbp-mcp-http.pid";
+    FILE* pf = fopen(pidfile, "r");
+    if (pf) {
+        long old_pid = 0;
+        if (fscanf(pf, "%ld", &old_pid) == 1 && old_pid > 1 && kill((pid_t)old_pid, 0) == 0) {
+            fclose(pf);
+            puts("HTTP MCP 桥接服务已在运行: http://127.0.0.1:37662");
+            puts("日志文件: /data/local/tmp/ls-hwbp-mcp.log");
+            puts("现在可以直接在 Claude App 里让我连接使用。");
+            return 0;
+        }
+        fclose(pf);
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        puts("启动 HTTP MCP 桥接服务失败：fork 失败");
+        return 1;
+    }
+    if (pid == 0) {
+        setsid();
+        int nullfd = open("/dev/null", O_RDWR);
+        if (nullfd >= 0) {
+            dup2(nullfd, 0);
+            dup2(nullfd, 1);
+            dup2(nullfd, 2);
+            if (nullfd > 2) close(nullfd);
+        }
+        _exit(run_mcp_http_server(37662));
+    }
+
+    pf = fopen(pidfile, "w");
+    if (pf) { fprintf(pf, "%ld\n", (long)pid); fclose(pf); }
+    puts("HTTP MCP 桥接服务已启动: http://127.0.0.1:37662");
+    puts("日志文件: /data/local/tmp/ls-hwbp-mcp.log");
+    puts("现在可以直接在 Claude App 里让我连接使用。");
+    return 0;
+}
+
 static bool ensure_target(std::string& current_target){
     std::string prompt = current_target.empty() ? "包名/进程名/PID: " : "包名/进程名/PID，回车复用当前目标: ";
     std::string input = prompt_str(prompt.c_str(), current_target.c_str());
@@ -251,7 +293,8 @@ int run_interactive(){
         }
         else if (c == 7) { cmd_remove(); }
         else if (c == 8) { start_mcp_bridge(); }
-        else if (c == 9) { puts("退出"); break; }
+        else if (c == 9) { start_http_mcp_bridge(); }
+        else if (c == 10) { puts("退出"); break; }
         else { puts("未知选项，请重新输入。"); }
     }
     return 0;
