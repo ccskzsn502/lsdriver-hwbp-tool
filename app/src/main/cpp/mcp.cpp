@@ -102,19 +102,21 @@ static int g_real_out = -1;
 static FILE* g_debug_log = nullptr;
 
 static void MCP_DEBUG_LOG(const char* fmt, ...){
-    va_list ap;
-    va_start(ap, fmt);
+    va_list ap1, ap2;
+    va_start(ap1, fmt);
+    va_start(ap2, fmt);
     // 写入日志文件
     if(g_debug_log) {
-        vfprintf(g_debug_log, fmt, ap);
+        vfprintf(g_debug_log, fmt, ap1);
         fprintf(g_debug_log, "\n");
         fflush(g_debug_log);
     }
     // 同时写入 stderr（会被 TCP 桥接器捕获显示）
-    vfprintf(stderr, fmt, ap);
+    vfprintf(stderr, fmt, ap2);
     fprintf(stderr, "\n");
     fflush(stderr);
-    va_end(ap);
+    va_end(ap1);
+    va_end(ap2);
 }
 
 static void send_message(const js::ValuePtr& msg){
